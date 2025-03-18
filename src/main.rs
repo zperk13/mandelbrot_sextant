@@ -10,7 +10,7 @@ fn main() {
     result.unwrap();
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Memory {
     scaler_x: Scaler,
     scaler_y: Scaler,
@@ -172,7 +172,7 @@ fn on_event(
     false
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 struct Scaler {
     original_min: f64,
     original_max: f64,

@@ -140,6 +140,9 @@ fn on_event(
             // When zooming, the number of cache hits is usually 0 or 1,
             // not worth spending time hashing for.
             // However, there are MANY cache hits when panning.
+            // Due to doing it this way,
+            // the first pan of a zoom will not have any cache hits,
+            // but all subsequent ones will
             let b = if is_pan {
                 match cache.get(&key) {
                     Some(b) => {

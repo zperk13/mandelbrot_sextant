@@ -15,7 +15,7 @@ struct Memory {
     scaler_x: Scaler,
     scaler_y: Scaler,
     threshhold: usize,
-    cache: DashMap<(HashableF64, HashableF64), bool>,
+    cache: DashMap<(HashableF64, HashableF64, usize), bool>,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -120,7 +120,7 @@ fn on_event(
         let y0 = scaler_y.scale(py as f64);
         for px in 0..bit_width {
             let x0 = scaler_x.scale(px as f64);
-            let key = (HashableF64(x0), HashableF64(y0));
+            let key = (HashableF64(x0), HashableF64(y0), *threshhold);
             let calculate_b = || {
                 let mut x = 0.0;
                 let mut y = 0.0;
@@ -156,6 +156,7 @@ fn on_event(
                     }
                 }
             } else {
+                cache.clear();
                 calculate_b()
             };
 
@@ -166,9 +167,10 @@ fn on_event(
     handler.render_bits().unwrap();
     handler
         .set_title(format!(
-            "Finished processing in {:?} threshhold={threshhold} cache_hits={}",
+            "Finished processing in {:?} threshhold={threshhold} cache_hits={}/{}",
             start.elapsed(),
-            cache_hits.load(atomic::Ordering::Relaxed)
+            cache_hits.load(atomic::Ordering::Relaxed),
+            handler.bit_area()
         ))
         .unwrap();
     handler.memory = Some(memory);

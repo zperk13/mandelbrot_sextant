@@ -1,9 +1,14 @@
+#![allow(clippy::too_many_arguments)]
+
 mod bits2d;
 mod sextant_terminal;
 
 use dashmap::DashMap;
 use rayon::prelude::*;
-use std::sync::{Arc, Mutex, atomic::{self, AtomicU64}};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{self, AtomicU64},
+};
 
 fn main() {
     let result = sextant_terminal::run(std::io::stdout(), None, on_event);
@@ -114,56 +119,8 @@ fn on_event(
     let bit_width = handler.bit_width();
     let bit_height = handler.bit_height();
     let arc_mutex = Arc::new(Mutex::new(&mut *handler));
-    let cache = Arc::new(cache);
     let cache_hits = &AtomicU64::new(0);
-    (0..bit_height).into_par_iter().for_each(move |py| {
-        let y0 = scaler_y.scale(py as f64);
-        for px in 0..bit_width {
-            let x0 = scaler_x.scale(px as f64);
-            let key = (HashableF64(x0), HashableF64(y0), *threshhold);
-            let calculate_b = || {
-                let mut x = 0.0;
-                let mut y = 0.0;
-                let mut x2 = 0.0;
-                let mut y2 = 0.0;
-                let mut iteration = 0;
-                while (x2 + y2 <= 4.0) && (iteration < *threshhold) {
-                    y = (x + x) * y + y0;
-                    x = x2 - y2 + x0;
-                    x2 = x * x;
-                    y2 = y * y;
-                    iteration += 1;
-                }
-                iteration == *threshhold
-            };
-            
-            // When zooming, the number of cache hits is usually 0 or 1,
-            // not worth spending time hashing for.
-            // However, there are MANY cache hits when panning.
-            // Due to doing it this way,
-            // the first pan of a zoom will not have any cache hits,
-            // but all subsequent ones will
-            let b = if is_pan {
-                match cache.get(&key) {
-                    Some(b) => {
-                        cache_hits.fetch_add(1, atomic::Ordering::Relaxed);
-                        *b.value()
-                    }
-                    None => {
-                        let b = calculate_b();
-                        cache.insert(key, b);
-                        b
-                    }
-                }
-            } else {
-                cache.clear();
-                calculate_b()
-            };
-
-            let mut lock = arc_mutex.lock().unwrap();
-            lock.set_bit(px, py, !b);
-        }
-    });
+    calculate_cpu_multithread(bit_width, bit_height, scaler_x, scaler_y, *threshhold, is_pan, cache, cache_hits, arc_mutex);
     handler.render_bits().unwrap();
     handler
         .set_title(format!(
@@ -231,4 +188,65 @@ impl Scaler {
             self.target_max + (self.scalar / 2.0),
         );
     }
+}
+
+fn calculate_cpu_multithread(
+    width: usize,
+    height: usize,
+    scaler_x: &Scaler,
+    scaler_y: &Scaler,
+    threshhold: usize,
+    is_pan: bool,
+    cache: &DashMap<(HashableF64, HashableF64, usize), bool>,
+    cache_hits: &AtomicU64,
+    handler: Arc<Mutex<&mut sextant_terminal::Handler<Option<Memory>>>>,
+) {
+    (0..height).into_par_iter().for_each(move |py| {
+        let y0 = scaler_y.scale(py as f64);
+        for px in 0..width {
+            let x0 = scaler_x.scale(px as f64);
+            let key = (HashableF64(x0), HashableF64(y0), threshhold);
+            let calculate_b = || {
+                let mut x = 0.0;
+                let mut y = 0.0;
+                let mut x2 = 0.0;
+                let mut y2 = 0.0;
+                let mut iteration = 0;
+                while (x2 + y2 <= 4.0) && (iteration < threshhold) {
+                    y = (x + x) * y + y0;
+                    x = x2 - y2 + x0;
+                    x2 = x * x;
+                    y2 = y * y;
+                    iteration += 1;
+                }
+                iteration == threshhold
+            };
+
+            // When zooming, the number of cache hits is usually 0 or 1,
+            // not worth spending time hashing for.
+            // However, there are MANY cache hits when panning.
+            // Due to doing it this way,
+            // the first pan of a zoom will not have any cache hits,
+            // but all subsequent ones will
+            let b = if is_pan {
+                match cache.get(&key) {
+                    Some(b) => {
+                        cache_hits.fetch_add(1, atomic::Ordering::Relaxed);
+                        *b.value()
+                    }
+                    None => {
+                        let b = calculate_b();
+                        cache.insert(key, b);
+                        b
+                    }
+                }
+            } else {
+                cache.clear();
+                calculate_b()
+            };
+
+            let mut lock = handler.lock().unwrap();
+            lock.set_bit(px, py, !b);
+        }
+    });
 }

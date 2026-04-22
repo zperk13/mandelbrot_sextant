@@ -4,13 +4,18 @@ mod bits2d;
 mod sextant_terminal;
 
 use dashmap::DashMap;
+use pollster::FutureExt as _;
 use rayon::prelude::*;
-use std::sync::{
-    Arc, Mutex,
-    atomic::{self, AtomicU64},
+use std::{
+    borrow::Cow,
+    sync::{
+        Arc, Mutex,
+        atomic::{self, AtomicU64},
+    },
 };
 
 fn main() {
+    env_logger::init();
     let result = sextant_terminal::run(std::io::stdout(), None, on_event);
     result.unwrap();
 }
@@ -19,6 +24,7 @@ fn main() {
 enum CalculationMethod {
     CpuSingleThread,
     CpuMultiThread,
+    Gpu,
 }
 
 impl CalculationMethod {
@@ -26,7 +32,8 @@ impl CalculationMethod {
         use CalculationMethod::*;
         *self = match self {
             CpuSingleThread => CpuMultiThread,
-            CpuMultiThread => CpuSingleThread,
+            CpuMultiThread => Gpu,
+            Gpu => CpuSingleThread,
         }
     }
 }
@@ -37,7 +44,7 @@ struct Memory {
     scaler_y: Scaler,
     threshhold: usize,
     cache: DashMap<(HashableF64, HashableF64, usize), bool>,
-    calculation_method: CalculationMethod
+    calculation_method: CalculationMethod,
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -53,7 +60,6 @@ impl From<f64> for HashableF64 {
         Self(value)
     }
 }
-
 
 fn on_event(
     handler: &mut sextant_terminal::Handler<Option<Memory>>,
@@ -137,7 +143,7 @@ fn on_event(
         scaler_y,
         threshhold,
         cache,
-        calculation_method
+        calculation_method,
     } = &memory;
     let bit_width = handler.bit_width();
     let bit_height = handler.bit_height();
@@ -166,6 +172,15 @@ fn on_event(
             cache_hits,
             arc_mutex,
         ),
+        CalculationMethod::Gpu => calculate_gpu(
+            bit_width,
+            bit_height,
+            scaler_x,
+            scaler_y,
+            *threshhold,
+            arc_mutex,
+        )
+        .block_on(),
     }
     handler.render_bits().unwrap();
     handler
@@ -345,4 +360,151 @@ fn calculate_cpu_singlethread(
             handler.clone(),
         );
     })
+}
+
+async fn calculate_gpu(
+    width: usize,
+    height: usize,
+    scaler_x: &Scaler,
+    scaler_y: &Scaler,
+    threshhold: usize,
+    handler: Arc<Mutex<&mut sextant_terminal::Handler<Option<Memory>>>>,
+) {
+    use wgpu::BufferUsages;
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let adapter = instance.request_adapter(&Default::default()).await.unwrap();
+    let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor {
+        required_features: wgpu::Features::SHADER_F64,
+        ..Default::default()
+    }).await.unwrap();
+
+    let Scaler {
+        original_min: original_min_x,
+        original_max: _,
+        target_min: target_min_x,
+        target_max: _,
+        scalar: scaler_x,
+    } = scaler_x;
+    let Scaler {
+        original_min: original_min_y,
+        original_max: _,
+        target_min: target_min_y,
+        target_max: _,
+        scalar: scaler_y,
+    } = scaler_y;
+
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: None,
+
+        source: wgpu::ShaderSource::Wgsl(Cow::from(format!(
+            "
+fn scale_x(n: f64) -> f64 {{
+    return (n-{original_min_x})*{scaler_x}+{target_min_x};
+}}
+
+fn scale_y(n: f64) -> f64 {{
+    return (n-{original_min_y})*{scaler_y}+{target_min_y};
+}}
+
+@group(0) @binding(0) var<storage, read_write> output: array<u32>;
+@compute
+@workgroup_size(256, 1, 1)
+fn main(
+    @builtin(global_invocation_id) global_invocation_id: vec3<u32>,
+) {{
+    let i = global_invocation_id.x;
+    if i >= arrayLength(&output) {{
+        return;
+    }}
+    let px = i % {width};
+    let py = i / {width};
+    let y0 = scale_y(f64(py));
+    let x0 = scale_x(f64(px));
+
+    var x: f64 = 0.0;
+    var y: f64 = 0.0;
+    var x2: f64 = 0.0;
+    var y2: f64 = 0.0;
+    var iteration = 0;
+    while (x2  + y2 <= 4.0) && (iteration < {threshhold}) {{
+        y = (x + x) * y + y0;
+        x = x2 - y2 + x0;
+        x2 = x * x;
+        y2 = y * y;
+        iteration += 1;
+    }}
+    if iteration == {threshhold} {{
+        output[i] = 0;
+    }} else {{
+        output[i] = 1;
+    }}
+}}
+"
+        ))),
+    });
+
+    let buffer_size = (width * height * 4) as u64;
+
+    let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: None,
+        layout: None,
+        module: &shader,
+        entry_point: None,
+        compilation_options: Default::default(),
+        cache: Default::default(),
+    });
+
+    let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("output"),
+        size: buffer_size,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    });
+    let temp_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("temp"),
+        size: buffer_size,
+        usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: None,
+        layout: &pipeline.get_bind_group_layout(0),
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: output_buffer.as_entire_binding(),
+        }],
+    });
+
+    let mut encoder = device.create_command_encoder(&Default::default());
+
+    {
+        let num_dispatchers = (width * height).div_ceil(256) as u32;
+        let mut pass = encoder.begin_compute_pass(&Default::default());
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch_workgroups(num_dispatchers, 1, 1);
+    }
+
+    encoder.copy_buffer_to_buffer(&output_buffer, 0, &temp_buffer, 0, buffer_size);
+
+    queue.submit([encoder.finish()]);
+
+    {
+        let (tx, rx) = std::sync::mpsc::channel();
+        temp_buffer.map_async(wgpu::MapMode::Read, .., move |result| {
+            tx.send(result).unwrap()
+        });
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        let _ = rx.recv().unwrap();
+
+        let output_data = temp_buffer.get_mapped_range(..);
+        let mut lock = handler.lock().unwrap();
+        for x in 0..width {
+            for y in 0..height {
+                lock.set_bit(x, y, output_data[(y * width + x) * 4] != 0);
+            }
+        }
+    }
+    temp_buffer.unmap();
 }

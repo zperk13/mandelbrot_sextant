@@ -179,8 +179,7 @@ fn on_event(
             scaler_y,
             *threshhold,
             arc_mutex,
-        )
-        .block_on(),
+        ),
     }
     handler.render_bits().unwrap();
     handler
@@ -362,7 +361,7 @@ fn calculate_cpu_singlethread(
     })
 }
 
-async fn calculate_gpu(
+fn calculate_gpu(
     width: usize,
     height: usize,
     scaler_x: &Scaler,
@@ -370,13 +369,27 @@ async fn calculate_gpu(
     threshhold: usize,
     handler: Arc<Mutex<&mut sextant_terminal::Handler<Option<Memory>>>>,
 ) {
-    use wgpu::BufferUsages;
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-    let adapter = instance.request_adapter(&Default::default()).await.unwrap();
-    let (device, queue) = adapter.request_device(&wgpu::DeviceDescriptor {
-        required_features: wgpu::Features::SHADER_F64,
-        ..Default::default()
-    }).await.unwrap();
+    use std::sync::LazyLock;
+
+    use wgpu::{BufferUsages, Instance};
+    static INSTANCE: LazyLock<Instance> =
+        LazyLock::new(|| Instance::new(wgpu::InstanceDescriptor::new_without_display_handle()));
+    static ADAPTER: LazyLock<wgpu::Adapter> = LazyLock::new(|| {
+        INSTANCE
+            .request_adapter(&Default::default())
+            .block_on()
+            .unwrap()
+    });
+    let device_queue: LazyLock<(wgpu::Device, wgpu::Queue)> = LazyLock::new(|| {
+        ADAPTER
+            .request_device(&wgpu::DeviceDescriptor {
+                required_features: wgpu::Features::SHADER_F64,
+                ..Default::default()
+            })
+            .block_on()
+            .unwrap()
+    });
+    let (device, queue) = &*device_queue;
 
     let Scaler {
         original_min: original_min_x,
